@@ -64,7 +64,7 @@ def get_engine_move(board: chess.Board, depth: int) -> chess.Move:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Play against the Phase 0 engine.")
+    parser = argparse.ArgumentParser(description="Play against the QUASAR baseline engine.")
     parser.add_argument("--color", choices=["white", "black"], default="white",
                          help="Which side you play (default: white)")
     parser.add_argument("--depth", type=int, default=3,
@@ -78,7 +78,7 @@ def main():
     print("=" * 60)
     print(f"You are playing {'White' if human_is_white else 'Black'}.")
     print(f"Engine depth: {args.depth} plies "
-          f"(plain alpha-beta, no TT, no quiescence -- Phase 0 baseline)")
+          f"(alpha-beta + TT + quiescence -- Phase 1 baseline)")
     print("Enter moves in SAN (e.g. Nf3) or UCI (e.g. g1f3). "
           "Type 'moves' to list legal moves, 'quit' to stop.")
     print("=" * 60)

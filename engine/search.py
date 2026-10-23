@@ -54,11 +54,15 @@ def order_moves(board: chess.Board, moves, tt_move: chess.Move = None):
 
 
 def quiescence(board: chess.Board, alpha: int, beta: int,
-                stats: SearchStats, ply: int = 0) -> int:
+                stats: SearchStats, ply: int = 0, q_ply: int = 0) -> int:
     """
     Captures-only quiescence search. Called at every depth==0 leaf instead
     of evaluate() directly -- this is what stops the engine from stopping
     mid-exchange and misjudging the position (the horizon effect).
+
+    Two separate counters: `ply` is the TOTAL distance from the root (used
+    for mate-distance scores, so they match the main search), `q_ply` is
+    how deep we are inside quiescence only (used for the safety cap).
 
     Uses the standard "stand pat" idea: the side to move isn't FORCED to
     capture, so the static eval is itself a valid lower bound on the score
@@ -83,7 +87,7 @@ def quiescence(board: chess.Board, alpha: int, beta: int,
     if alpha < stand_pat:
         alpha = stand_pat
 
-    if ply >= MAX_QUIESCENCE_PLY:
+    if q_ply >= MAX_QUIESCENCE_PLY:
         return alpha
 
     captures = [m for m in board.legal_moves if board.is_capture(m)]
@@ -91,7 +95,7 @@ def quiescence(board: chess.Board, alpha: int, beta: int,
 
     for move in captures:
         board.push(move)
-        score = -quiescence(board, -beta, -alpha, stats, ply + 1)
+        score = -quiescence(board, -beta, -alpha, stats, ply + 1, q_ply + 1)
         board.pop()
 
         if score >= beta:
@@ -134,7 +138,7 @@ def alphabeta(board: chess.Board, depth: int, alpha: int, beta: int,
 
     if depth == 0:
         stats.leaf_nodes += 1
-        return quiescence(board, alpha, beta, stats, ply=0)
+        return quiescence(board, alpha, beta, stats, ply=ply)
 
     best = -INF
     best_move = None
