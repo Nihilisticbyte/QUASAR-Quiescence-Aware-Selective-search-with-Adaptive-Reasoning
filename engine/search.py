@@ -35,6 +35,14 @@ class SearchStats:
     qnodes: int = 0          # nodes spent inside quiescence search
     max_depth_reached: int = 0
     tt_cutoffs: int = 0      # times a TT entry let us skip a re-search
+    node_limit: int = None   # hard cap on TOTAL nodes (alpha-beta + quiescence);
+                             # None = unlimited (fixed-depth behaviour)
+    completed_depth: int = 0 # deepest iterative-deepening iteration that finished
+
+
+class SearchAborted(Exception):
+    """Raised when the node budget runs out mid-search. Caught by
+    iterative_deepening(), which falls back to the last COMPLETE iteration."""
 
 
 def order_moves(board: chess.Board, moves, tt_move: chess.Move = None):
@@ -70,6 +78,8 @@ def quiescence(board: chess.Board, alpha: int, beta: int,
     of check -- check-evasion in quiescence is a known Phase 1 limitation,
     see project-plan.md).
     """
+    if stats.node_limit is not None and stats.nodes >= stats.node_limit:
+        raise SearchAborted
     stats.nodes += 1
     stats.qnodes += 1
 
@@ -108,6 +118,8 @@ def quiescence(board: chess.Board, alpha: int, beta: int,
 
 def alphabeta(board: chess.Board, depth: int, alpha: int, beta: int,
                stats: SearchStats, tt: TranspositionTable, ply: int = 0) -> int:
+    if stats.node_limit is not None and stats.nodes >= stats.node_limit:
+        raise SearchAborted
     stats.nodes += 1
     stats.max_depth_reached = max(stats.max_depth_reached, ply)
 
@@ -205,7 +217,8 @@ def search_root(board: chess.Board, depth: int, tt: TranspositionTable = None,
 
 
 def iterative_deepening(board: chess.Board, max_depth: int,
-                          tt: TranspositionTable = None):
+                          tt: TranspositionTable = None,
+                          node_budget: int = None):
     """
     Searches depth 1, 2, 3, ... max_depth in sequence, reusing the same TT
     across iterations. Returns the final (deepest) iteration's result, plus
@@ -213,15 +226,33 @@ def iterative_deepening(board: chess.Board, max_depth: int,
     showing the PV firming up as depth increases, and is also where a
     later time-budget cutoff would plug in (stop between iterations if
     out of time, always returning the last COMPLETE iteration's move).
+
+    node_budget: if given, search stops as soon as TOTAL nodes (alpha-beta +
+    quiescence) would exceed it. The unfinished iteration is thrown away and
+    the last COMPLETE iteration's move/score is returned. Set max_depth high
+    (e.g. 64) to let the budget be the only limit. stats.completed_depth
+    records how deep the search got. Each iteration runs on a copy of the
+    board, so an abort can never leave the caller's board mid-search.
     """
     if tt is None:
         tt = TranspositionTable()
-    stats = SearchStats()
+    stats = SearchStats(node_limit=node_budget)
 
     history = []
     best_move, best_score = None, 0
     for depth in range(1, max_depth + 1):
-        best_move, best_score, stats = search_root(board, depth, tt, stats)
+        try:
+            move, score, stats = search_root(board.copy(), depth, tt, stats)
+        except SearchAborted:
+            break
+        best_move, best_score = move, score
+        stats.completed_depth = depth
         history.append((depth, best_move, best_score))
+
+    if best_move is None:
+        # Budget too small to even finish depth 1: still return a legal move
+        # (first by move ordering) instead of None. Score is unknown -> 0.
+        moves = order_moves(board, list(board.legal_moves))
+        best_move = moves[0] if moves else None
 
     return best_move, best_score, stats, history
