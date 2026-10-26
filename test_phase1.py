@@ -76,7 +76,7 @@ def check_quiescence_catches_recapture():
     black_relative = quiescence(board, -10**9, 10**9, stats)
     true_white_relative = -black_relative
 
-    print(f"  position after Qxe5 (Black rook on e7 defends e5):")
+    print("  position after Qxe5 (Black rook on e7 defends e5):")
     print(f"  naive snapshot (White's view, ignoring reply): "
           f"{naive_white_relative:+d}cp (looks good for White)")
     print(f"  quiescence's true value (White's view, after Rxe5): "

@@ -92,7 +92,19 @@ def check_pgn_sampler():
             assert p.best_moves == [] and p.source == "real"
         assert max(per_game.values()) <= 2, "per-game cap violated"
         print(f"  10 positions from {len(per_game)} games, ply in range, "
-              f"max {max(per_game.values())}/game, deterministic. PASS\n")
+              f"max {max(per_game.values())}/game, deterministic. PASS")
+
+        # Regression: file order must not bias the sample. 20 games in the
+        # file, ask for 6 positions at 1/game: the old sampler always
+        # returned games 1-6 (the start of the file).
+        path2 = os.path.join(d, "many.pgn")
+        make_random_pgn(path2, games=20, seed=5)
+        picked = sample_pgn_positions(path2, 6, min_ply=12, max_ply=60,
+                                      per_game=1, seed=3)
+        games_used = sorted(int(p.id.split(".")[1]) for p in picked)
+        print(f"  6 positions drawn from games {games_used} of 20")
+        assert max(games_used) > 6, "sample is biased towards the start of the file"
+        print("  no file-order bias. PASS\n")
 
 
 def smoke_run(n=5, budget=3000):

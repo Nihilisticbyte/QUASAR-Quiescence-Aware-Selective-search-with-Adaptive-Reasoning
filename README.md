@@ -3,123 +3,132 @@
 Project 16: Quiescence-Aware Minimax with Selective Search Extensions
 (chess, Python, `python-chess`).
 
+**Thesis.** Under equal node budgets, an instability-triggered, budget-aware extension
+controller reduces decision error relative to fixed-depth iterative-deepening alpha-beta
+and captures-only quiescence search. Whether this holds is an empirical question: the
+repository contains everything needed to measure it, and the plan/report record what was
+actually found (see `project-plan.md`, `REPORT.md`).
+
 ## Status
 
-| Phase | What                                                            | Status      |
-| ----- | --------------------------------------------------------------- | ----------- |
-| 0     | Plain alpha-beta baseline (material + PST eval)                 | DONE        |
-| 1     | Transposition table + quiescence search + iterative deepening   | DONE        |
-| 2     | Evaluation harness (node budgets, Stockfish oracle, metrics)    | NEXT        |
-| 3-6   | Instability signal, extension controller, experiments, write-up | Not started |
+| Phase | What                                                                                             | Status                                                      |
+| ----- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------- |
+| 0     | Plain alpha-beta baseline (material + piece-square eval)                                         | done                                                        |
+| 1     | Transposition table, quiescence, iterative deepening                                             | done                                                        |
+| 2     | Evaluation harness: node budgets, Stockfish oracle, WAC + real-game positions, comparison runner | done                                                        |
+| 3     | Instability features, ground-truth labelling, trigger analysis, stability diagnostic             | done                                                        |
+| 4     | Extension controllers (check rule, instability trigger, cost-weighted, checks-in-quiescence)     | done                                                        |
+| 5     | Paired comparison, ablations, engine-vs-engine matches                                           | tooling done, **full-scale experiments to be run**          |
+| 6     | Write-up                                                                                         | skeleton in `REPORT.md`, tables via `make_report_tables.py` |
 
-Phase 0 proved the foundation is correct. Phase 1 added the baseline
-every later result is compared against: a TT, captures-only quiescence
-search (the horizon-effect fix) and iterative deepening. No selective
-extensions yet, on purpose.
+## Setup (Windows PowerShell, no virtual environment needed)
+
+```powershell
+pip install -r requirements.txt
+# Stockfish: download from https://stockfishchess.org/download/ , extract, then:
+$env:STOCKFISH_PATH = "C:\full\path\to\stockfish.exe"      # this window only
+setx STOCKFISH_PATH "C:\full\path\to\stockfish.exe"        # permanent (open a new window afterwards)
+python run_tests.py --fast                                 # everything except the slow Phase 0 self-play
+```
+
+Run every command from the project folder (the one containing `engine\`).
+`py` works in place of `python` if `python` is not recognised.
 
 ## Files
 
-- `engine/eval.py` — material + piece-square-table static evaluation
-  (White-relative).
-- `engine/search.py` — negamax alpha-beta with TT probing/storing,
-  captures-only quiescence (stand-pat), `search_root` and
-  `iterative_deepening`, plus a node counter that separates
-  alpha-beta nodes from quiescence nodes.
-- `engine/tt.py` — dict-backed transposition table, Zobrist-keyed,
-  EXACT/LOWERBOUND/UPPERBOUND flags, no replacement policy yet.
-- `play.py` — human-vs-engine command-line game (`--color`, `--depth`).
-- `test_phase0.py` — perft, self-play legality, node-count baseline.
-- `test_phase1.py` — legality, node counts vs Phase 0, quiescence
-  recapture demo, TT consistency.
+| File                                                                  | Purpose                                                                                                              |
+| --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `engine/eval.py`                                                      | material + piece-square-table evaluation (White-relative)                                                            |
+| `engine/tt.py`                                                        | transposition table keyed by the exact position (python-chess position key)                                          |
+| `engine/search.py`                                                    | alpha-beta, quiescence (with check evasions), iterative deepening, node budget, repetition tracking, extension hooks |
+| `engine/extensions.py`                                                | extension controllers and the engine registry (`controller_factories`)                                               |
+| `engine/features.py`                                                  | position-only instability features (`n_checks`, `threat_gain`, ...)                                                  |
+| `engine/stability.py`                                                 | Clune-style stability diagnostic (total vs adjacent variance)                                                        |
+| `engine/trigger_log.py`, `engine/trigger_analysis.py`                 | Phase 3: frontier sampling, ground-truth labels, trigger accuracy, probability model                                 |
+| `engine/oracle.py`                                                    | Stockfish oracle: best move, score, centipawn loss of a move                                                         |
+| `engine/positions.py`                                                 | WAC / PGN position loading and the train/test split                                                                  |
+| `engine/harness.py`                                                   | runs engines at node budgets, scores them against Stockfish, summarises with confidence intervals                    |
+| `engine/compare.py`, `engine/report.py`                               | paired comparison statistics and Markdown tables                                                                     |
+| `engine/match.py`                                                     | engine-vs-engine matches                                                                                             |
+| `run_baseline.py`                                                     | main experiment runner (any set of engines)                                                                          |
+| `log_instability.py`, `analyze_instability.py`, `stability_report.py` | Phase 3 scripts                                                                                                      |
+| `compare_engines.py`, `make_report_tables.py`, `match.py`             | Phase 5/6 scripts                                                                                                    |
+| `play.py`                                                             | play against the engine in the terminal                                                                              |
+| `run_tests.py`, `test_*.py`                                           | tests (`python run_tests.py`)                                                                                        |
+| `data/wac.epd`                                                        | Win At Chess suite, 300 tactical positions with book moves                                                           |
+| `data/real_games.pgn`                                                 | real games to sample non-tactical-suite positions from                                                               |
+| `data/trigger_model.json`                                             | P(value changes \| number of checks), built by `analyze_instability.py`                                              |
 
-## Run it
+## Engine versions (names for `--engines`)
 
-```bash
-pip install python-chess --break-system-packages
-python3 test_phase0.py
-python3 test_phase1.py
+| Name                        | What it does                                                                                                                                                               |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `baseline`                  | iterative deepening + TT + quiescence (captures and check evasions)                                                                                                        |
+| `check`                     | baseline + the classic rule: +1 ply when the move gives check                                                                                                              |
+| `inst_c1/c2/c3`             | check rule + 1 extra ply at the search frontier when the side to move has at least 1/2/3 checking moves and the value is near the window                                   |
+| `qchk_all`, `qchk_c1/c2/c3` | check rule + quiet checking moves searched inside quiescence at the frontier (always / when triggered)                                                                     |
+| `costw_l10/20/40/80`        | frontier extension when P(change) x shift >= lambda x cost, from `data/trigger_model.json`                                                                                 |
+| ablations                   | `inst_c2_nowin` (no window gate), `inst_c2_nocheck` (no check rule), `qchk_c2_nowin`, `inst_gain200` (first hypothesis: capture gain; kept to report that it did not work) |
+
+Add a new variant by adding one line to `controller_factories()` in `engine/extensions.py`.
+
+## Running the research (in this order)
+
+```powershell
+# Phase 3: which positions deserve extra search? (no Stockfish needed, a few minutes)
+python log_instability.py                    # frontier positions + ground-truth labels, TRAIN split
+python analyze_instability.py                # accuracy of each feature; writes data\trigger_model.json
+python stability_report.py                   # Clune-style stability table
+
+# Phase 4/5: tune on TRAIN positions, never on test
+python run_baseline.py --split train --engines baseline check inst_c2 qchk_c2 costw_l40 --budgets 8000 --out results\train.csv
+
+# Phase 5: final comparison on held-out TEST positions (use the same --oracle-depth and Stockfish for every file you compare)
+python run_baseline.py --split test --engines baseline check inst_c2 qchk_c2 costw_l40 --out results\test.csv
+python compare_engines.py --results results\test.csv
+python make_report_tables.py --results results\test.csv
+
+# Optional headline number (lowest rigour)
+python match.py --a check --b baseline --budget 2000 --openings 20 --out results\match_check.csv
 ```
 
-On Windows, create a virtual environment first
-(`python -m venv .venv`, activate it, then `pip install python-chess`).
+`run_baseline.py` saves after every run and can be stopped and restarted. It writes a
+`.meta.json` next to each results file (search version, Stockfish version, oracle depth)
+and refuses to append results made under different settings.
 
-## Phase 0 results
+## Method in one page
 
-1. **Perft (move generator correctness)** — matched known-correct
-   values at depths 1–4 (20, 400, 8902, 197281). This confirms
-   `python-chess`'s legal-move generation is trustworthy, so any bugs
-   from here on are in _our_ code, not the library.
-2. **Self-play** — the engine played 40 plies against itself at depth 3
-   with zero illegal moves.
-3. **Node-count baseline** — recorded node counts at depths 1–4 from the
-   starting position (see table below). **Keep these numbers.** Every
-   later phase (TT, quiescence search, extensions) should be compared
-   against this baseline to check it's actually helping, not just
-   adding complexity.
-
-| Depth | Best move | Score (cp) | Nodes | Leaf nodes | Time  |
-| ----- | --------- | ---------- | ----- | ---------- | ----- |
-| 1     | Nf3       | 50         | 20    | 20         | 0.00s |
-| 2     | Nf3       | 0          | 83    | 63         | 0.02s |
-| 3     | Nf3       | 50         | 776   | 693        | 0.17s |
-| 4     | Nf3       | 0          | 3,108 | 2,323      | 0.71s |
-
-Node counts roughly grow with branching factor per ply — expected for
-plain alpha-beta with decent move ordering (no TT yet, so no cross-branch
-reuse).
-
-## Phase 1 results (reported honestly)
-
-- **Quiescence works:** in the test position, a naive snapshot after
-  `Qxe5` reads +405cp for White; quiescence resolves the recapture and
-  returns -500cp. That is the horizon-effect fix doing its job.
-- **TT benefit is small at shallow depth.** Alpha-beta-only nodes
-  (quiescence excluded) vs the Phase 0 baseline: depth 1: 20 vs 20,
-  depth 2: 83 vs 83, depth 3: 785 vs 776 (slightly worse, probe
-  overhead), depth 4: 2,917 vs 3,108 (about 6% fewer). The TT pays off
-  mostly across iterative-deepening iterations.
-- **Quiescence adds real nodes** (about +2,577 at depth 4, roughly as
-  many as the alpha-beta nodes). That is the cost of fixing the horizon
-  effect, and is why Phase 2 compares at equal node budgets.
+- **Equal node budgets.** Every engine gets the same number of TOTAL nodes (alpha-beta +
+  quiescence) per position; iterative deepening returns the best move found when the budget ends.
+- **Primary metric: decision error.** Centipawn loss of the chosen move against Stockfish
+  (fixed depth, one thread), plus move-match rate, book-move solve rate (WAC) and big-miss rate.
+  Rates carry Wilson 95% intervals, mean loss a bootstrap interval.
+- **Paired comparison.** Versions are compared position by position (same positions, same budgets):
+  mean difference with bootstrap CI, exact sign test, McNemar for solves.
+- **Cost beyond nodes.** Extension logic costs time that node counts hide; the tables report the
+  wall-clock ratio and extensions per search.
+- **Trigger design from data.** `log_instability.py` labels frontier positions by whether one more
+  ply changes their value by >= 100 cp; `analyze_instability.py` reports which features predict that.
+- **Held-out test.** WAC is shuffled and halved; real games are split by game. Tune on train, report on test.
 
 ## Known limitations
 
-- Quiescence does not search check evasions (captures only).
-- Mate scores are not ply-adjusted when stored in / read from the TT.
-- TT has no replacement policy (always overwrite).
-- `can_claim_draw()` is path-dependent and can interact with the TT
-  (graph-history interaction); revisit if odd draw scores appear.
-- Eval is material + PST only (no king safety or pawn structure).
+- Evaluation is material + piece-square tables only (no king safety, pawn structure, mobility).
+  It is not the research contribution, but it caps absolute strength and makes tactics look
+  different from a strong engine's.
+- Draw detection inside the search is two-fold repetition on the current path and the fifty-move
+  rule; scores stored in the transposition table can still embed path-dependent draws.
+- Extensions that depend on the (alpha, beta) window can reach the same position at different
+  depths along different paths; the TT stores the depth actually searched (see `engine/extensions.py`).
+- Stockfish is depth-limited and version-dependent; the oracle is an approximation of the truth.
+- The real-game set mixes eras and one source (McDonnell, 1830s) contributes a large share of games.
+- Python speed: node budgets are measured in nodes, so conclusions do not depend on machine speed,
+  but the extensions' extra work per node does cost wall-clock time.
 
-## Fixed since Phase 1
+## References
 
-- Quiescence now receives the real ply from the root (separate `q_ply`
-  counter for its depth cap), so mate-distance scores are consistent
-  between the main search and quiescence.
-
-## Design notes for later phases
-
-- **Score convention:** `evaluate()` in `eval.py` is always White-relative.
-  `search.py` flips the sign for Black in the negamax convention — don't
-  duplicate that flip elsewhere.
-- **Terminal states** (checkmate/stalemate/draw) are handled in _both_
-  `eval.py` and `search.py` right now — `search.py`'s checks fire first
-  during search, `eval.py`'s only matter if `evaluate()` is called
-  directly. Keep this in mind when quiescence search calls `evaluate()`
-  at a non-terminal leaf.
-- **`MATE_SCORE - ply`**: mate scores are offset by ply so the search
-  prefers delivering mate sooner / being mated later. This matters once
-  you add a TT (mate scores need adjusting relative to TT-stored depth)
-  — flagged now so it's not a surprise in Phase 1.
-
-## Next: Phase 2 — evaluation harness
-
-1. Node-budgeted search (stop at N nodes, return last completed
-   iteration's move).
-2. Stockfish oracle via the python-chess UCI interface.
-3. Decision-error metrics: move-match rate and centipawn loss.
-4. Test set: WAC plus real-game positions.
-5. Comparison runner: position x engine version -> move, nodes, time,
-   error vs oracle.
-
-Full plan and research framing: `project-plan.md`.
+- S. Russell and E. Wefald, _On Optimal Game-Tree Search using Rational Meta-Reasoning_, IJCAI 1989.
+- A. Plaat, J. Schaeffer, W. Pijls, A. de Bruin, _Best-First Fixed-Depth Game-Tree Search in Practice_, IJCAI 1995.
+- J. Clune, _Heuristic Evaluation Functions for General Game Playing_, AAAI 2007.
+- Win At Chess positions: `wacnew.epd` from github.com/fsmosca/EPD-Analyzer (GPL-3.0).
+- Test games: Chessentials PGN collections (chessentials.com/chess-pgn-downloads/) and the Croatian championship files.

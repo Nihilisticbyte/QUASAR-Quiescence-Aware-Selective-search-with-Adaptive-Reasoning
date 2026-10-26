@@ -98,16 +98,22 @@ PST = {
 }
 
 
-def evaluate(board: chess.Board) -> int:
+def evaluate(board: chess.Board, terminal_checks: bool = True) -> int:
     """
     Static evaluation of `board`, in centipawns, from White's perspective.
     Positive = good for White, negative = good for Black.
+
+    terminal_checks=False skips the checkmate/stalemate/draw tests. The
+    search has ALREADY decided those before it calls evaluate() (and the
+    repetition tests are slow), so it passes False; direct callers keep the
+    safe default.
     """
-    if board.is_checkmate():
-        return -100000 if board.turn == chess.WHITE else 100000
-    if board.is_stalemate() or board.is_insufficient_material() or \
-            board.is_seventyfive_moves() or board.is_fivefold_repetition():
-        return 0
+    if terminal_checks:
+        if board.is_checkmate():
+            return -100000 if board.turn == chess.WHITE else 100000
+        if board.is_stalemate() or board.is_insufficient_material() or \
+                board.is_seventyfive_moves() or board.is_fivefold_repetition():
+            return 0
 
     score = 0
     for square, piece in board.piece_map().items():

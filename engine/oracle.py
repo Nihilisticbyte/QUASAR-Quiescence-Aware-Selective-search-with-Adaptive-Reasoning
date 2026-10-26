@@ -61,6 +61,7 @@ class StockfishOracle:
         self._cache: dict = {}
         self._engine = chess.engine.SimpleEngine.popen_uci(find_stockfish(path))
         self._engine.configure({"Threads": 1, "Hash": hash_mb})
+        self.version = self._engine.id.get("name", "unknown")   # e.g. "Stockfish 16"
 
     # --- lifecycle -------------------------------------------------------
     def close(self):

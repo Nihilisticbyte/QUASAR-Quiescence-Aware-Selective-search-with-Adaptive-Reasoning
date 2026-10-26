@@ -1,0 +1,20 @@
+{
+ "search_version": "3",
+ "oracle": "Stockfish 19",
+ "oracle_depth": 12,
+ "fields": [
+  "engine",
+  "pos_id",
+  "source",
+  "budget",
+  "move",
+  "nodes",
+  "depth",
+  "time_s",
+  "oracle_best",
+  "oracle_match",
+  "book_hit",
+  "cp_loss",
+  "extensions"
+ ]
+}

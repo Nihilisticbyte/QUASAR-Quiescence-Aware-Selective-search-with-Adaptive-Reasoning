@@ -17,9 +17,14 @@ diff description):
 """
 
 import chess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from .eval import evaluate
 from .tt import TranspositionTable, Flag
+
+SEARCH_VERSION = "3"   # bump whenever search behaviour changes: results files record it
+                       # 1 = Phase 1 baseline; 2 = cheap draw/repetition, TT mate
+                       # scores by ply, check evasions in quiescence, controllers;
+                       # 3 = partial-iteration results, checks in quiescence (controller-gated)
 
 MATE_SCORE = 100000
 INF = 10 ** 9
@@ -38,11 +43,72 @@ class SearchStats:
     node_limit: int = None   # hard cap on TOTAL nodes (alpha-beta + quiescence);
                              # None = unlimited (fixed-depth behaviour)
     completed_depth: int = 0 # deepest iterative-deepening iteration that finished
+    partial_depth: int = 0   # depth of an iteration that was cut off by the budget but
+                             # had finished at least one root move (its best move is used)
+    extensions: int = 0      # times an extension controller added depth
+    frontier_hook: object = None  # optional callable(board, ply), called at every
+                                  # depth-0 node BEFORE quiescence (Phase 3 logging)
 
 
 class SearchAborted(Exception):
     """Raised when the node budget runs out mid-search. Caught by
-    iterative_deepening(), which falls back to the last COMPLETE iteration."""
+    iterative_deepening(). When raised out of search_root it also carries the
+    best root move among those whose search had FINISHED (best_move is None if
+    not even the first root move finished)."""
+    best_move = None
+    best_score = 0
+
+
+MATE_BOUND = MATE_SCORE - 1000   # |score| beyond this means "a forced mate was found"
+
+
+def to_tt(score: int, ply: int) -> int:
+    """Mate scores are 'MATE_SCORE minus plies from the ROOT'. A TT entry may
+    be reused at a different ply, so store them relative to the NODE
+    (plies to mate from here) and convert back on read. Without this the
+    engine can misjudge how fast a mate is when the entry is reused."""
+    if score >= MATE_BOUND:
+        return score + ply
+    if score <= -MATE_BOUND:
+        return score - ply
+    return score
+
+
+def from_tt(score: int, ply: int) -> int:
+    if score >= MATE_BOUND:
+        return score - ply
+    if score <= -MATE_BOUND:
+        return score + ply
+    return score
+
+
+def is_cheap_draw(board: chess.Board) -> bool:
+    """Draws that need no move history: insufficient material, or the
+    fifty-move rule (100 half-moves). Replaces board.can_claim_draw(), which
+    replays moves to count repetitions and was measured at ~78% of all
+    runtime. Repetitions are handled separately by RepetitionTracker."""
+    return board.halfmove_clock >= 100 or board.is_insufficient_material()
+
+
+class RepetitionTracker:
+    """
+    Counts how often each position occurred on the CURRENT path: the game
+    history before the root plus the line being searched. A node whose
+    position already occurred on that path is scored as a draw (two-fold
+    repetition, the usual engine convention: if one side can repeat, it can
+    force the third occurrence). Built once per root search from the board's
+    move stack; alphabeta() adds/removes entries as it descends/returns.
+    """
+
+    def __init__(self, board: chess.Board, key_fn):
+        self.counts = {}
+        b = board.copy()
+        keys = [key_fn(b)]
+        while b.move_stack:
+            b.pop()
+            keys.append(key_fn(b))
+        for k in keys:
+            self.counts[k] = self.counts.get(k, 0) + 1
 
 
 def order_moves(board: chess.Board, moves, tt_move: chess.Move = None):
@@ -62,7 +128,8 @@ def order_moves(board: chess.Board, moves, tt_move: chess.Move = None):
 
 
 def quiescence(board: chess.Board, alpha: int, beta: int,
-                stats: SearchStats, ply: int = 0, q_ply: int = 0) -> int:
+                stats: SearchStats, ply: int = 0, q_ply: int = 0,
+                checks: bool = False) -> int:
     """
     Captures-only quiescence search. Called at every depth==0 leaf instead
     of evaluate() directly -- this is what stops the engine from stopping
@@ -72,11 +139,18 @@ def quiescence(board: chess.Board, alpha: int, beta: int,
     for mate-distance scores, so they match the main search), `q_ply` is
     how deep we are inside quiescence only (used for the safety cap).
 
+    checks=True (only honoured at q_ply 0, outside check) additionally searches
+    the quiet moves that give check, after the captures. Captures-only
+    quiescence cannot see a mate or a winning attack that starts with a quiet
+    check, so this is the cheap way to look for exactly the forcing moves it
+    misses. Controllers switch it on only at unstable frontier nodes.
+
     Uses the standard "stand pat" idea: the side to move isn't FORCED to
-    capture, so the static eval is itself a valid lower bound on the score
-    (assuming there's always a quiet move available, which is true outside
-    of check -- check-evasion in quiescence is a known Phase 1 limitation,
-    see project-plan.md).
+    capture, so the static eval is itself a valid lower bound on the score.
+    That only holds OUTSIDE check. When the side to move is in check it may
+    not stand pat (it must answer the check), so in check we search ALL legal
+    moves (the evasions) and take no stand-pat bound. This fixes the Phase 1
+    limitation where a position in check was scored as if it were quiet.
     """
     if stats.node_limit is not None and stats.nodes >= stats.node_limit:
         raise SearchAborted
@@ -85,25 +159,29 @@ def quiescence(board: chess.Board, alpha: int, beta: int,
 
     if board.is_checkmate():
         return -MATE_SCORE + ply
-    if board.is_stalemate() or board.is_insufficient_material() or \
-            board.can_claim_draw():
+    if board.is_stalemate() or is_cheap_draw(board):
         return 0
 
-    stand_pat = evaluate(board)
+    stand_pat = evaluate(board, terminal_checks=False)
     stand_pat = stand_pat if board.turn == chess.WHITE else -stand_pat
 
-    if stand_pat >= beta:
-        return beta
-    if alpha < stand_pat:
-        alpha = stand_pat
+    if board.is_check():
+        if q_ply >= MAX_QUIESCENCE_PLY:
+            return max(alpha, min(beta, stand_pat))   # safety cap: fall back to static
+        moves = order_moves(board, list(board.legal_moves))   # evasions, no stand-pat
+    else:
+        if stand_pat >= beta:
+            return beta
+        if alpha < stand_pat:
+            alpha = stand_pat
+        if q_ply >= MAX_QUIESCENCE_PLY:
+            return alpha
+        moves = order_moves(board, list(board.generate_legal_captures()))
+        if checks and q_ply == 0:
+            moves += [m for m in board.legal_moves
+                      if not board.is_capture(m) and board.gives_check(m)]
 
-    if q_ply >= MAX_QUIESCENCE_PLY:
-        return alpha
-
-    captures = [m for m in board.legal_moves if board.is_capture(m)]
-    captures = order_moves(board, captures)
-
-    for move in captures:
+    for move in moves:
         board.push(move)
         score = -quiescence(board, -beta, -alpha, stats, ply + 1, q_ply + 1)
         board.pop()
@@ -117,7 +195,8 @@ def quiescence(board: chess.Board, alpha: int, beta: int,
 
 
 def alphabeta(board: chess.Board, depth: int, alpha: int, beta: int,
-               stats: SearchStats, tt: TranspositionTable, ply: int = 0) -> int:
+               stats: SearchStats, tt: TranspositionTable, ply: int = 0,
+               rep: RepetitionTracker = None, ctl=None) -> int:
     if stats.node_limit is not None and stats.nodes >= stats.node_limit:
         raise SearchAborted
     stats.nodes += 1
@@ -126,38 +205,56 @@ def alphabeta(board: chess.Board, depth: int, alpha: int, beta: int,
     if board.is_checkmate():
         stats.leaf_nodes += 1
         return -MATE_SCORE + ply
-    if board.is_stalemate() or board.is_insufficient_material() or \
-            board.can_claim_draw():
+    if board.is_stalemate() or is_cheap_draw(board):
         stats.leaf_nodes += 1
         return 0
 
+    key = tt.key(board)          # computed once, reused for probe/store/repetition
+    if rep is not None and rep.counts.get(key, 0) >= 1:
+        stats.leaf_nodes += 1
+        return 0                 # position already occurred on this path: draw
+
     alpha_orig = alpha
     tt_move = None
-    entry = tt.probe(board)
+    entry = tt.probe_key(key)
     if entry is not None:
         tt_move = entry.best_move
         if entry.depth >= depth:
+            tt_score = from_tt(entry.score, ply)
             if entry.flag == Flag.EXACT:
                 stats.tt_cutoffs += 1
-                return entry.score
+                return tt_score
             elif entry.flag == Flag.LOWERBOUND:
-                alpha = max(alpha, entry.score)
+                alpha = max(alpha, tt_score)
             elif entry.flag == Flag.UPPERBOUND:
-                beta = min(beta, entry.score)
+                beta = min(beta, tt_score)
             if alpha >= beta:
                 stats.tt_cutoffs += 1
-                return entry.score
+                return tt_score
 
     if depth == 0:
         stats.leaf_nodes += 1
-        return quiescence(board, alpha, beta, stats, ply=ply)
+        if stats.frontier_hook is not None:
+            stats.frontier_hook(board, ply)
+        want_checks = ctl is not None and ctl.checks_at_frontier(board, alpha, beta)
+        if want_checks:
+            stats.extensions += 1
+        return quiescence(board, alpha, beta, stats, ply=ply, checks=want_checks)
 
     best = -INF
     best_move = None
     moves = order_moves(board, list(board.legal_moves), tt_move)
+    if rep is not None:
+        rep.counts[key] = 1      # this node is now on the path
     for move in moves:
         board.push(move)
-        score = -alphabeta(board, depth - 1, -beta, -alpha, stats, tt, ply + 1)
+        child_depth = depth - 1
+        if ctl is not None:
+            ext = ctl.extension(board, move, child_depth, ply + 1, -beta, -alpha, stats)
+            if ext:
+                stats.extensions += 1
+                child_depth += ext
+        score = -alphabeta(board, child_depth, -beta, -alpha, stats, tt, ply + 1, rep, ctl)
         board.pop()
 
         if score > best:
@@ -167,6 +264,8 @@ def alphabeta(board: chess.Board, depth: int, alpha: int, beta: int,
             alpha = best
         if alpha >= beta:
             break  # beta cutoff
+    if rep is not None:
+        del rep.counts[key]
 
     # Store what we learned into the TT.
     if best <= alpha_orig:
@@ -175,16 +274,18 @@ def alphabeta(board: chess.Board, depth: int, alpha: int, beta: int,
         flag = Flag.LOWERBOUND
     else:
         flag = Flag.EXACT
-    tt.store(board, depth, best, flag, best_move)
+    tt.store_key(key, depth, to_tt(best, ply), flag, best_move)
 
     return best
 
 
 def search_root(board: chess.Board, depth: int, tt: TranspositionTable = None,
-                 stats: SearchStats = None):
+                 stats: SearchStats = None, ctl=None):
     """Returns (best_move, score, stats) for `board` at fixed `depth`.
     Pass a shared `tt`/`stats` across calls (e.g. from iterative_deepening)
-    to reuse the table and accumulate node counts."""
+    to reuse the table and accumulate node counts. `ctl` is an optional
+    extension controller (engine/extensions.py); None = plain search.
+    Scores are relative to the side to move."""
     if tt is None:
         tt = TranspositionTable()
     if stats is None:
@@ -193,17 +294,37 @@ def search_root(board: chess.Board, depth: int, tt: TranspositionTable = None,
     best_move = None
     best_score = -INF
     alpha, beta = -INF, INF
+    rep = RepetitionTracker(board, tt.key)
 
     entry = tt.probe(board)
     tt_move = entry.best_move if entry else None
 
     moves = order_moves(board, list(board.legal_moves), tt_move)
     if not moves:
-        return None, evaluate(board), stats
+        # No legal move: checkmate (we lost) or stalemate (draw). Side-to-move score.
+        return None, (-MATE_SCORE if board.is_check() else 0), stats
 
+    if ctl is not None:
+        ctl.start_search(depth)
     for move in moves:
         board.push(move)
-        score = -alphabeta(board, depth - 1, -beta, -alpha, stats, tt, ply=1)
+        child_depth = depth - 1
+        if ctl is not None:
+            ext = ctl.extension(board, move, child_depth, 1, -beta, -alpha, stats)
+            if ext:
+                stats.extensions += 1
+                child_depth += ext
+        try:
+            score = -alphabeta(board, child_depth, -beta, -alpha, stats, tt, ply=1,
+                               rep=rep, ctl=ctl)
+        except SearchAborted as e:
+            # Out of nodes. The board is mid-search and must not be reused (the
+            # callers search a copy). Hand back the best FINISHED root move so
+            # a cut-off iteration still counts: the first root move tried is the
+            # previous iteration's best, and a later move only becomes "best" if
+            # it beat it, so this result is never worse than the last iteration.
+            e.best_move, e.best_score = best_move, best_score
+            raise
         board.pop()
 
         if score > best_score:
@@ -218,7 +339,7 @@ def search_root(board: chess.Board, depth: int, tt: TranspositionTable = None,
 
 def iterative_deepening(board: chess.Board, max_depth: int,
                           tt: TranspositionTable = None,
-                          node_budget: int = None):
+                          node_budget: int = None, controller=None):
     """
     Searches depth 1, 2, 3, ... max_depth in sequence, reusing the same TT
     across iterations. Returns the final (deepest) iteration's result, plus
@@ -228,11 +349,16 @@ def iterative_deepening(board: chess.Board, max_depth: int,
     out of time, always returning the last COMPLETE iteration's move).
 
     node_budget: if given, search stops as soon as TOTAL nodes (alpha-beta +
-    quiescence) would exceed it. The unfinished iteration is thrown away and
-    the last COMPLETE iteration's move/score is returned. Set max_depth high
+    quiescence) would exceed it. If the cut-off iteration had already finished
+    at least one root move, the best of those is returned (stats.partial_depth
+    says which depth); otherwise the last COMPLETE iteration's move/score is
+    returned. Set max_depth high
     (e.g. 64) to let the budget be the only limit. stats.completed_depth
     records how deep the search got. Each iteration runs on a copy of the
     board, so an abort can never leave the caller's board mid-search.
+
+    controller: optional extension controller (see engine/extensions.py).
+    None gives exactly the plain Phase 1 search.
     """
     if tt is None:
         tt = TranspositionTable()
@@ -240,14 +366,21 @@ def iterative_deepening(board: chess.Board, max_depth: int,
 
     history = []
     best_move, best_score = None, 0
+    partial = None
     for depth in range(1, max_depth + 1):
         try:
-            move, score, stats = search_root(board.copy(), depth, tt, stats)
-        except SearchAborted:
+            move, score, stats = search_root(board.copy(), depth, tt, stats,
+                                             ctl=controller)
+        except SearchAborted as e:
+            if e.best_move is not None:
+                partial = (e.best_move, e.best_score)
+                stats.partial_depth = depth
             break
         best_move, best_score = move, score
         stats.completed_depth = depth
         history.append((depth, best_move, best_score))
+    if partial is not None:
+        best_move, best_score = partial
 
     if best_move is None:
         # Budget too small to even finish depth 1: still return a legal move

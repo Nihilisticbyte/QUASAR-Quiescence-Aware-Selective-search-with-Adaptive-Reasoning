@@ -67,7 +67,18 @@ def check_tiny_budget_fallback():
     assert move in board.legal_moves
     assert stats.completed_depth == 0 and hist == []
     print(f"  budget=5: no iteration finished, fallback move "
-          f"{board.san(move)} (legal). PASS\n")
+          f"{board.san(move)} (legal).")
+
+    # Depth 1 needs ~40 nodes from the start position. With 30 the iteration is
+    # cut off, but some root moves had finished: the best of THOSE is returned
+    # (partial result), not an arbitrary first move.
+    board = chess.Board()
+    fen = board.fen()
+    move, score, stats, hist = iterative_deepening(board, 64, node_budget=30)
+    assert stats.completed_depth == 0 and stats.partial_depth == 1, stats
+    assert move in board.legal_moves and board.fen() == fen and stats.nodes <= 30
+    print(f"  budget=30: depth 1 cut off after some root moves; partial result "
+          f"{board.san(move)} used (legal, board untouched). PASS\n")
 
 
 def check_big_budget_matches_plain():
@@ -85,9 +96,30 @@ def check_big_budget_matches_plain():
     print("  -> PASS\n")
 
 
+def check_partial_iteration():
+    print("=" * 60)
+    print("6. A CUT-OFF ITERATION STILL COUNTS (best finished root move)")
+    print("=" * 60)
+    seen_partial = 0
+    for name, fen in POSITIONS.items():
+        for budget in range(150, 4001, 250):
+            board = chess.Board(fen)
+            move, score, stats, hist = iterative_deepening(board, 64, node_budget=budget)
+            assert stats.nodes <= budget and move in board.legal_moves
+            if stats.partial_depth:
+                seen_partial += 1
+                # a partial iteration is always the one AFTER the last complete one
+                assert stats.partial_depth == stats.completed_depth + 1, (name, budget)
+        big = iterative_deepening(chess.Board(fen), 3, node_budget=10**9)[2]
+        assert big.partial_depth == 0, "no iteration is cut off when the budget never fires"
+    assert seen_partial > 0, "sweep never produced a partial iteration (test would be vacuous)"
+    print(f"  {seen_partial} budgets ended inside an iteration; partial depth = completed + 1 each time. PASS\n")
+
+
 if __name__ == "__main__":
     check_cap_and_board_intact()
     check_more_budget_not_shallower()
     check_tiny_budget_fallback()
     check_big_budget_matches_plain()
+    check_partial_iteration()
     print("Node-budgeted search verified.")
