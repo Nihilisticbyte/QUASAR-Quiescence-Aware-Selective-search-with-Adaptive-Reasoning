@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 data/instability_log.csv
 results/sandbox*
+
+.vscode/
+data/error_log.csv

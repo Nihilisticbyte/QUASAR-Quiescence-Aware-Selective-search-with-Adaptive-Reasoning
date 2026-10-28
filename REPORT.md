@@ -8,7 +8,7 @@
 ## Abstract
 
 [FILL after results: one paragraph. Problem (horizon effect, fixed-depth cut-off), approach
-(instability-triggered extensions under equal node budgets), main finding with numbers,
+(cost-benefit selection of checking moves at the search frontier under equal node budgets), main finding with numbers,
 main limitation.]
 
 ## 1. Problem
@@ -30,8 +30,8 @@ an extension adds depth to a branch that is still inside the nominal search.
   the expected improvement in the chosen move, weighed against the cost of computing. Their MGSS*
   is best-first, keeps the whole tree in memory and needs an error distribution learned offline
   from about 35,000 positions; it does not fit a depth-first alpha-beta engine directly. We borrow
-  the *idea\* (expected gain versus cost), not the algorithm: the cost-weighted controller
-  extends when `P(change) x shift >= lambda x cost`. They themselves point to selective extension
+  the *idea\* (expected gain versus cost), not the algorithm: the controller
+  searches a check when `expected gain in window >= lambda x cost`. They themselves point to selective extension
   beyond the alpha-beta horizon (singular extensions) as the natural application.
 - **Plaat et al. (1995), MTD(f).** Their experiments used iterative deepening and a transposition table
   on real programs and found MTD(f) beating aspiration NegaScout on leaf nodes, total nodes and time.
@@ -41,8 +41,8 @@ an extension adds depth to a branch that is still inside the nominal search.
   is a possible extension. [Note: it is SSS*/MTD(+inf), not MTD(f), that visits too many interior nodes.]
 - **Clune (2007), stability.** Clune's stability quotient (total variance over adjacent variance of a
   feature) is an _offline_ tool for selecting evaluation features from sampled states. Our per-node
-  trigger is our own design; `stability_report.py` applies Clune's diagnostic offline to our features
-  as context only.
+  trigger is our own design; `fit_error_model.py` reports his quotient offline per bucket
+  as a diagnostic only.
 
 ## 3. Method
 
@@ -60,16 +60,29 @@ the budget is exhausted and plays the best move found among the root moves whose
 
 ### 3.3 Extension controllers
 
-[Describe each registered engine, see README table. State what is path-dependent and the TT trade-off.]
+`check`: +1 ply when a move gives check (capped at 4 per line). `qchk_all`: additionally, at every depth-0
+node, plain quiescence runs first and then every quiet checking move is searched (no decision).
+`rw_l*`: the same, but each quiet check is searched only if
 
-### 3.4 Choosing the trigger from data
+    expected gain inside (alpha, beta)  >=  lambda x mean node cost x budget pressure.
 
-`log_instability.py` samples frontier positions (where the depth-limited search hands over to
-quiescence) and labels each by whether one extra ply changes its value by at least 100 cp
-(one pawn; smaller thresholds mix in the ~50 cp tempo effect of a piece-square table).
-`analyze_instability.py` reports, per feature, the AUC and the precision/recall of threshold rules.
-[FILL: the table from your run. Two things to state from the data: (a) whether the capture-gain
-hypothesis held, (b) which feature predicted change best and by how much.]
+Expected gain is the mean over K empirical quantiles e of the error distribution of
+max(0, min(q + e, beta) - max(q, alpha)), where q is the plain quiescence value. Because extra moves can only
+raise the value of the side to move, a node with q >= beta is skipped exactly, and value movement outside the
+window is worth nothing (Russell and Wefald's "relevant node" idea in alpha-beta form). Budget pressure is
+1 / (fraction of nodes remaining), capped at 20. Checks are searched most forcing first. `rand_p33` searches each
+check with probability 1/3 and is a control. All decisions are made at depth-0 nodes, which are never stored in the
+TT, so window-dependent logic cannot change what the table stores; this is the answer to the TT risk in the plan.
+Not implemented: MGSS\* (best-first), MTD(f) with extensions (untested in the literature).
+
+### 3.4 Learning the error model
+
+`fit_error_model.py` samples frontier nodes visited by real depth-2 and depth-3 searches from TRAIN positions and,
+for each quiet check there, records e = value gain from searching it (clipped at 0 and 1000 cp), the nodes it took,
+and the number of replies the opponent has. Replies were chosen as the bucket feature because it predicted a useful
+check better than the number of checks at the node (AUC 0.76 vs 0.67 on the training sample). The same script
+prints Clune's stability quotient per bucket (total variance of the value over adjacent-step variance), used
+offline as he uses it; it is a summary of the same data, not independent evidence. [FILL: bucket table from your run.]
 
 ## 4. Experimental setup
 
@@ -81,7 +94,7 @@ hypothesis held, (b) which feature predicted change best and by how much.]
 - **Budgets.** [FILL: node budgets used]. **Sample sizes.** [FILL: positions per source].
 - **Metrics, in priority order.** (1) decision error: mean centipawn loss against Stockfish, move-match rate,
   book solve rate, rate of big misses (>= 200 cp); (2) nodes, at equal budgets, plus extensions per search and
-  wall-clock ratio; (3) trigger accuracy (precision/recall against the ground-truth labels);
+  wall-clock ratio; (3) selection quality: does `rw_*` beat the random control `rand_p33` at the same pass rate;
   (4) playing strength from engine-vs-engine matches (lowest rigour).
 - **Statistics.** Wilson intervals for rates, bootstrap intervals for mean loss, paired differences per
   position, exact sign test and McNemar test. [Note the number of comparisons made if reporting p-values.]
@@ -102,7 +115,7 @@ hypothesis held, (b) which feature predicted change best and by how much.]
 
 ### 5.4 Ablations
 
-[FILL: `inst_c2_nowin` (window gate), `inst_c2_nocheck` (check rule), `inst_gain200` (first hypothesis).]
+[FILL: `rw_l0.1_nowindow`, `rw_l0.1_nobudget`, `rw_l0.1_nocheck`, and the `rand_p33` control.]
 
 ### 5.5 Playing strength
 

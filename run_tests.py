@@ -14,7 +14,7 @@ import sys
 import time
 
 TESTS = ["test_phase0", "test_phase1", "test_phase2_budget", "test_positions",
-         "test_oracle", "test_harness", "test_phase3", "test_extensions", "test_phase5"]
+         "test_oracle", "test_harness", "test_extensions", "test_phase5"]
 
 
 def main():

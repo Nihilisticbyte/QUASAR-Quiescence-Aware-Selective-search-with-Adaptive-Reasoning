@@ -1,32 +1,42 @@
 """
-Phase 4 checks: extension controllers and how they plug into the search.
+Extension controllers and how they plug into the search.
 
 Run: python test_extensions.py        (no Stockfish needed)
 
-1. A controller that never extends gives exactly the plain search.
-2. Extension-depth bookkeeping (the per-line cap) is arithmetic-correct.
+1. NoExtension gives exactly the plain search.
+2. The per-line extension count is arithmetic-correct.
 3. CheckExtension fires on checks only, and respects its cap.
-4. InstabilityExtension: frontier-only, window gate, ablation switches.
-5. TriggerModel buckets and the cost-weighted rule.
-6. Every registered engine runs: stays inside its node budget, returns a legal
-   move, leaves the caller's board untouched, and is deterministic.
+4. The two-phase frontier search: a quiet-check mate is found by the check
+   pass; a node that already reaches beta never reaches the controller.
+5. ErrorModel: bucket lookup, expected gain inside the window, persistence.
+6. RWChecks: gain vs price per check, relevance (window), forcing order,
+   budget pressure, ablations.
+7. Every registered engine runs: stays inside its node budget, returns a
+   legal move, leaves the caller's board untouched, and is deterministic.
 """
 
 import os
+import tempfile
 import chess
-from engine.extensions import (NoExtension, CheckExtension, InstabilityExtension,
-                               CostWeightedExtension, QuiescenceChecks, TriggerModel,
-                               controller_factories, Controller)
+from engine.error_model import ErrorModel, fit, quantile_grid
+from engine.extensions import (NoExtension, CheckExtension, BlindChecks, RWChecks,
+                               Controller, controller_factories, MAX_PRESSURE)
 from engine.harness import ENGINES
 from engine.positions import load_epd
-from engine.search import iterative_deepening, SearchStats, quiescence, MATE_SCORE
+from engine.search import (iterative_deepening, SearchStats, quiescence,
+                           frontier_search, MATE_SCORE)
 
-TWO_CHECKS = "4k3/8/8/8/8/8/Q7/R3K3 w - - 0 1"       # Qe2+ / Qa4+ ... available, not in check
-CHECKING_MOVE_FEN = "4k3/8/8/8/8/8/8/R3K3 w - - 0 1"   # Ra8+ gives check
+TWO_CHECKS = "4k3/8/8/8/8/8/Q7/R3K3 w - - 0 1"       # several quiet checks available, not in check
+BACK_RANK = "6k1/5ppp/8/8/8/8/8/R3K3 w - - 0 1"      # Ra8# is mate in 1 by a quiet check
 
 
 def ext_call(ctl, board, depth_after, ply, alpha=-10**6, beta=10**6):
     return ctl.extension(board, chess.Move.null(), depth_after, ply, alpha, beta, SearchStats())
+
+
+def flat_model(e=300.0, cost=10.0):
+    """One bucket: searching any check moves the value by exactly `e` and costs `cost` nodes."""
+    return ErrorModel([0], [[e] * 20], [cost], [100])
 
 
 def check_noext_equals_plain():
@@ -47,8 +57,8 @@ def check_bookkeeping():
     print("=" * 60)
     c = Controller()
     c.start_search(3)
-    assert c.path_extensions(depth_after=1, ply=2) == 0     # 2 + 1 = 3 = root depth
-    assert c.path_extensions(depth_after=2, ply=2) == 1     # one ply already added
+    assert c.path_extensions(depth_after=1, ply=2) == 0
+    assert c.path_extensions(depth_after=2, ply=2) == 1
     assert c.path_extensions(depth_after=4, ply=3) == 4
     print("  ply + depth - root_depth counts plies already added. PASS\n")
 
@@ -59,114 +69,135 @@ def check_check_extension():
     print("=" * 60)
     ctl = CheckExtension(max_ext=2)
     ctl.start_search(3)
-    checked = chess.Board("R3k3/8/8/8/8/8/8/4K3 b - - 0 1")    # black king in check from Ra8
-    quiet = chess.Board()
+    checked = chess.Board("R3k3/8/8/8/8/8/8/4K3 b - - 0 1")
     assert checked.is_check() and ext_call(ctl, checked, 1, 2) == 1
-    assert ext_call(ctl, quiet, 1, 2) == 0
-    # line already extended twice (ply 3 + depth 2 - root 3 = 2): cap reached
-    assert ext_call(ctl, checked, 2, 3) == 0
+    assert ext_call(ctl, chess.Board(), 1, 2) == 0
+    assert ext_call(ctl, checked, 2, 3) == 0, "cap reached"
     print("  extends on check, not on quiet moves, stops at the cap. PASS\n")
 
 
-def check_instability():
+def check_frontier_search():
     print("=" * 60)
-    print("4. InstabilityExtension")
+    print("4. TWO-PHASE FRONTIER SEARCH")
     print("=" * 60)
-    two = chess.Board(TWO_CHECKS)
-    ctl = InstabilityExtension(min_checks=2, margin=150)
-    ctl.start_search(3)
-    # static value of this position for White is large (~ +1400): window must contain it
-    assert ext_call(ctl, two, 0, 3, alpha=1000, beta=2000) == 1, "frontier + unstable + in window"
-    assert ext_call(ctl, two, 1, 2, alpha=1000, beta=2000) == 0, "not at the frontier -> no extension"
-    assert ext_call(ctl, two, 0, 3, alpha=-100, beta=100) == 0, "value far above window -> irrelevant"
-    off = InstabilityExtension(min_checks=2, use_window=False)
-    off.start_search(3)
-    assert ext_call(off, two, 0, 3, alpha=-100, beta=100) == 1, "window ablation extends anyway"
-    assert ext_call(ctl, chess.Board(), 0, 3, alpha=-100, beta=100) == 0, "no checks -> stable"
-    # in check: only the check rule may fire (the instability rule defers to quiescence evasions)
-    in_check = chess.Board("R3k3/8/8/8/8/8/8/4K3 b - - 0 1")
-    assert ext_call(ctl, in_check, 0, 3) == 1
-    nocheck = InstabilityExtension(min_checks=2, use_check=False)
-    nocheck.start_search(3)
-    assert ext_call(nocheck, in_check, 0, 3) == 0, "check-rule ablation"
-    # cap
-    capped = InstabilityExtension(min_checks=2, max_ext=1)
-    capped.start_search(3)
-    assert ext_call(capped, two, 0, 3, alpha=1000, beta=2000) == 1, "no plies added yet -> allowed"
-    assert ext_call(capped, two, 0, 4, alpha=1000, beta=2000) == 0, "ply 4 + depth 0 - root 3 = 1 added -> capped"
-    try:
-        InstabilityExtension(min_checks=0, min_gain=0)
-        raise AssertionError("a trigger with no condition must be rejected")
-    except ValueError:
-        pass
-    print("  frontier-only, window gate, both ablations, cap, bad config rejected. PASS\n")
-
-
-def check_cost_weighted():
-    print("=" * 60)
-    print("5. TriggerModel AND CostWeightedExtension")
-    print("=" * 60)
-    m = TriggerModel("n_checks", [0, 1, 2], [0.0, 0.5, 0.9], [0.0, 100.0, 300.0])
-    assert m.p_change(0) == 0.0 and m.p_change(1) == 0.5 and m.p_change(7) == 0.9
-    assert m.expected_shift(2) == 270.0 and m.expected_shift(1) == 50.0
-    try:
-        TriggerModel("n_checks", [0, 1], [0.1], [1.0])
-        raise AssertionError("length mismatch must be rejected")
-    except ValueError:
-        pass
-    try:
-        TriggerModel.load("/nonexistent/model.json")
-        raise AssertionError("missing model must raise")
-    except FileNotFoundError:
-        pass
-    two = chess.Board(TWO_CHECKS)
-    cheap = CostWeightedExtension(m, lam=10.0)
-    cheap.start_search(3)
-    dear = CostWeightedExtension(m, lam=1000.0)
-    dear.start_search(3)
-    assert ext_call(cheap, two, 0, 3, alpha=1000, beta=2000) == 1, "270cp expected shift beats a small lambda"
-    assert ext_call(dear, two, 0, 3, alpha=1000, beta=2000) == 0, "...but not a huge lambda"
-    assert ext_call(cheap, chess.Board(), 0, 3, alpha=-100, beta=100) == 0, "no checks -> never"
-    print("  bucket lookup, expected shift, bad models rejected, lambda trades benefit for cost. PASS\n")
-
-
-def check_quiescence_checks():
-    print("=" * 60)
-    print("5b. CHECKS IN QUIESCENCE")
-    print("=" * 60)
-    # White to move, back-rank mate by Ra8#. Captures-only quiescence cannot find it.
-    mate = chess.Board("6k1/5ppp/8/8/8/8/8/R3K3 w - - 0 1")
+    mate = chess.Board(BACK_RANK)
     plain = quiescence(mate, -10**9, 10**9, SearchStats())
-    with_checks = quiescence(mate, -10**9, 10**9, SearchStats(), checks=True)
-    assert plain < 1000 and with_checks > MATE_SCORE - 10, (plain, with_checks)
-    print(f"  mate in 1 by a quiet check: plain quiescence {plain}, with checks {with_checks}")
+    blind = frontier_search(mate, -10**9, 10**9, SearchStats(), 0, BlindChecks())
+    assert plain < 1000 and blind > MATE_SCORE - 10, (plain, blind)
+    print(f"  mate in 1 by a quiet check: plain quiescence {plain}, with check pass {blind}")
 
+    class Spy(Controller):
+        calls = 0
+
+        def frontier_checks(self, *a):
+            Spy.calls += 1
+            return []
+
+    # static value of this position is huge for White: with beta = 100 plain quiescence already cuts off
+    frontier_search(chess.Board(TWO_CHECKS), -100, 100, SearchStats(), 0, Spy())
+    assert Spy.calls == 0, "q >= beta: nothing can change, controller must not be asked"
+    frontier_search(chess.Board(TWO_CHECKS), -10**6, 10**6, SearchStats(), 0, Spy())
+    assert Spy.calls == 1
+    frontier_search(chess.Board("R3k3/8/8/8/8/8/8/4K3 b - - 0 1"), -10**6, 10**6, SearchStats(), 0, Spy())
+    assert Spy.calls == 1, "in check: evasions already searched, controller not asked"
+    s = SearchStats()
+    assert frontier_search(chess.Board(BACK_RANK), -10**9, 10**9, s, 0, None) == plain and s.extensions == 0
+    print("  quiet-check mate found; q>=beta and in-check skip the controller. PASS\n")
+
+
+def check_error_model():
+    print("=" * 60)
+    print("5. ErrorModel")
+    print("=" * 60)
+    m = ErrorModel([1, 3], [[0.0, 100.0], [0.0, 400.0]], [10.0, 50.0], [5, 5])
+    assert m.bucket(1) == 0 and m.bucket(2) == 0 and m.bucket(3) == 1 and m.bucket(9) == 1
+    assert m.cost(2) == 10.0 and m.cost(4) == 50.0
+    # bucket 0, base 0, window (-50, 50): e=0 gains 0; e=100 is clipped to the window top -> 50. mean 25
+    assert m.expected_gain(1, 0, -50, 50) == 25.0
+    # window entirely above what any error can reach -> nothing to gain
+    assert m.expected_gain(1, 0, 200, 1000) == 0.0
+    # base already at/over beta -> nothing to gain
+    assert m.expected_gain(1, 60, -50, 50) == 0.0
+    # base below alpha: only the part of the error that climbs INTO the window counts
+    assert m.expected_gain(3, -100, 0, 1000) == 150.0   # (0 + (300-0)) / 2
+    for bad in (lambda: ErrorModel([1, 2], [[0.0]], [1.0], [1]), lambda: ErrorModel([], [], [], [])):
+        try:
+            bad()
+            raise AssertionError("bad model must be rejected")
+        except ValueError:
+            pass
+    rows = [{"evasions": 1, "e": 0, "cost": 4}, {"evasions": 1, "e": 200, "cost": 6},
+            {"evasions": 4, "e": 50, "cost": 30}]
+    f = fit(rows, edges=[1, 3], k=2)
+    assert f.n == [2, 1] and f.cost_nodes == [5.0, 30.0] and f.quantiles[0] == [0, 200]
+    assert quantile_grid([], 3) == [0.0, 0.0, 0.0]
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.json")
+        m.save(path)
+        m2 = ErrorModel.load(path)
+        assert (m2.edges, m2.quantiles, m2.cost_nodes) == (m.edges, m.quantiles, m.cost_nodes)
+        try:
+            ErrorModel.load(os.path.join(d, "missing.json"))
+            raise AssertionError("missing model must raise")
+        except FileNotFoundError:
+            pass
+    print("  buckets, clipped gain, relevance, fit, save/load, bad input. PASS\n")
+
+
+def check_rw_controller():
+    print("=" * 60)
+    print("6. RWChecks")
+    print("=" * 60)
     two = chess.Board(TWO_CHECKS)
-    always = QuiescenceChecks(min_checks=0)
-    gated = QuiescenceChecks(min_checks=2)
-    assert always.checks_at_frontier(chess.Board(), -100, 100), "unconditional: always"
-    assert not gated.checks_at_frontier(chess.Board(), -100, 100), "no checks available"
-    assert gated.checks_at_frontier(two, 1000, 2000), "enough checks and value in window"
-    assert not gated.checks_at_frontier(two, -100, 100), "value far outside the window"
-    assert not gated.checks_at_frontier(chess.Board("R3k3/8/8/8/8/8/8/4K3 b - - 0 1"), -10**6, 10**6), \
-        "in check: quiescence already searches evasions"
-    off = QuiescenceChecks(min_checks=2, use_window=False)
-    assert off.checks_at_frontier(two, -100, 100), "window ablation"
-    # the instability part must NOT add depth, only the check rule may
-    gated.start_search(3)
-    assert ext_call(gated, two, 0, 3, alpha=1000, beta=2000) == 0
-    assert ext_call(gated, chess.Board("R3k3/8/8/8/8/8/8/4K3 b - - 0 1"), 1, 2) == 1
-    print("  trigger, window gate, in-check exemption, no extra depth. PASS\n")
+    fresh = SearchStats()
+    # window (-50, 50), base 0, error 300: expected gain = 50. price = lam * 10 nodes.
+    got = RWChecks(flat_model(), lam=1).frontier_checks(two, 0, -50, 50, fresh)
+    assert got and all(two.gives_check(m) and not two.is_capture(m) for m in got), "gain 50 >= price 10"
+    assert not RWChecks(flat_model(), lam=10).frontier_checks(two, 0, -50, 50, fresh), "gain 50 < price 100"
+    assert not RWChecks(flat_model(), lam=1).frontier_checks(two, 0, 5000, 6000, fresh), \
+        "window far above any reachable value: irrelevant"
+    assert RWChecks(flat_model(), lam=10, use_window=False).frontier_checks(two, 0, 5000, 6000, fresh), \
+        "window ablation counts the full 300cp"
+    assert not RWChecks(flat_model(), lam=1).frontier_checks(chess.Board(), 0, -50, 50, fresh), "no quiet checks"
+
+    assert RWChecks.pressure(SearchStats()) == 1.0, "no budget -> price never rises"
+    assert RWChecks.pressure(SearchStats(nodes=0, node_limit=1000)) == 1.0
+    assert abs(RWChecks.pressure(SearchStats(nodes=500, node_limit=1000)) - 2.0) < 1e-9
+    assert RWChecks.pressure(SearchStats(nodes=999, node_limit=1000)) == MAX_PRESSURE
+    late = SearchStats(nodes=900, node_limit=1000)        # pressure 10 -> price 100 > gain 50
+    assert not RWChecks(flat_model(), lam=1).frontier_checks(two, 0, -50, 50, late)
+    assert RWChecks(flat_model(), lam=1, budget_aware=False).frontier_checks(two, 0, -50, 50, late), \
+        "budget ablation ignores the remaining budget"
+
+    # forcing-ness: a mating check (0 replies) is worth its 1 node even at a high price,
+    # a loose check (model says it gains nothing) is never searched
+    forcing = ErrorModel([0, 1], [[1000.0] * 20, [0.0] * 20], [1.0, 10.0], [10, 10])
+    mate = chess.Board(BACK_RANK)
+    assert [m.uci() for m in RWChecks(forcing, lam=100).frontier_checks(mate, 145, -10**6, 10**6, fresh)] == ["a1a8"]
+    assert not RWChecks(forcing, lam=1).frontier_checks(two, 0, -10**6, 10**6, fresh), \
+        "checks with replies available gain nothing in this model"
+    ordered = ErrorModel([0, 1, 2], [[0.0] * 20, [500.0] * 20, [500.0] * 20], [1.0, 1.0, 1.0], [1, 1, 1])
+    mv = RWChecks(ordered, lam=1).frontier_checks(two, 0, -10**6, 10**6, fresh)
+    counts = []
+    for m in mv:
+        two.push(m); counts.append(two.legal_moves.count()); two.pop()
+    assert counts == sorted(counts), "most forcing check first"
+
+    ctl = RWChecks(flat_model(), lam=1)
+    ctl.start_search(3)
+    in_check = chess.Board("R3k3/8/8/8/8/8/8/4K3 b - - 0 1")
+    assert ext_call(ctl, in_check, 1, 2) == 1, "check rule is kept"
+    assert ext_call(RWChecks(flat_model(), use_check=False), in_check, 1, 2) == 0, "check-rule ablation"
+    print("  gain vs price, window relevance, mate-in-1 priced at 1 node, forcing order, budget pressure, ablations. PASS\n")
 
 
 def check_registry():
     print("=" * 60)
-    print("6. EVERY REGISTERED ENGINE RUNS SAFELY")
+    print("7. EVERY REGISTERED ENGINE RUNS SAFELY")
     print("=" * 60)
     positions = load_epd(os.path.join("data", "wac.epd"), limit=5)
-    names = sorted(ENGINES)
     total_ext = {}
-    for name in names:
+    for name in sorted(ENGINES):
         for p in positions:
             board = p.board()
             fen = board.fen()
@@ -178,8 +209,9 @@ def check_registry():
                 f"{name} is not deterministic"
             total_ext[name] = total_ext.get(name, 0) + stats.extensions
     assert total_ext["baseline"] == 0
-    assert total_ext["check"] > 0, "check extension never fired on 5 tactical positions"
-    print("  engines:", ", ".join(f"{n}({total_ext[n]})" for n in names))
+    assert total_ext["check"] > 0 and total_ext["qchk_all"] > total_ext["check"]
+    assert total_ext["rw_l0.1"] >= total_ext["rw_l2"], "a cheaper price extends at least as often"
+    print("  engines:", ", ".join(f"{n}({total_ext[n]})" for n in sorted(ENGINES)))
     print("  (number = extensions over 5 positions) budgets respected, deterministic. PASS\n")
 
 
@@ -188,8 +220,8 @@ if __name__ == "__main__":
     check_noext_equals_plain()
     check_bookkeeping()
     check_check_extension()
-    check_instability()
-    check_cost_weighted()
-    check_quiescence_checks()
+    check_frontier_search()
+    check_error_model()
+    check_rw_controller()
     check_registry()
     print("Extension controllers verified.")

@@ -1,5 +1,5 @@
 {
- "search_version": "3",
+ "search_version": "4",
  "oracle": "Stockfish 19",
  "oracle_depth": 12,
  "fields": [

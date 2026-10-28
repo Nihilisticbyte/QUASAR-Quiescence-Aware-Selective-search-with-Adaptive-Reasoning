@@ -1,70 +1,87 @@
 """
-Search-extension controllers (Phase 4).
+Search-extension controllers.
 
-A controller decides, for each move the search is about to play, whether the
-child position deserves extra search depth. The search (engine/search.py)
-calls
+A controller decides where the search spends extra effort. The search
+(engine/search.py) asks it two questions:
 
-    controller.extension(board_after_move, move, depth_after, ply, alpha, beta, stats)
+  extension(...)        for each move about to be played: add plies to the child?
+  frontier_checks(...)  at each depth-0 node, AFTER plain quiescence has run:
+                        should the quiet checking moves also be searched?
 
-with the child position already on the board, and adds the returned number of
-plies (0 or more) to that child's remaining depth.
+Engines (names for run_baseline.py --engines):
 
-Controllers, in increasing sophistication:
+  NoExtension      baseline: nothing extra.
+  CheckExtension   classic fixed rule, +1 ply when the move gives check. Any real
+                   engine has this, so it is the honest minimum (beating plain
+                   alpha-beta alone would be a strawman).
+  BlindChecks      "qchk_all": the check pass at EVERY frontier node. No logic;
+                   it is the brute-force comparator the selective controller
+                   has to beat on cost-effectiveness, not a design to keep.
+  RWChecks         "rw_*": searches a quiet checking move at a frontier node only
+                   if its expected value, inside the alpha-beta window, beats its
+                   price in nodes. See below.
 
-  NoExtension              does nothing (== the plain Phase 1 search)
-  CheckExtension           classic fixed rule: +1 ply when the move gives check.
-                           A real engine already has this, so it is the honest
-                           baseline: beating plain alpha-beta alone would be a
-                           strawman (project-plan.md, loophole 5).
-  InstabilityExtension     check rule PLUS +1 ply at the search FRONTIER
-                           (depth_after == 0) when the position is "unstable"
-                           and its value could matter for the window.
-  CostWeightedExtension    same gate, but the trigger weighs expected benefit
-                           against cost:  P(change) * shift  >=  lambda * cost
-  QuiescenceChecks         check rule PLUS, at triggered frontier nodes, a
-                           quiescence that also tries the quiet CHECKING moves
-                           (instead of a full-width extra ply). Same trigger,
-                           much cheaper "extension": only the forcing moves that
-                           captures-only quiescence cannot see are searched.
+RWChecks: what is taken from Russell & Wefald (1989), and what is not
+---------------------------------------------------------------------
+R&W: a search step is worth taking if the expected improvement in the decision
+it can cause exceeds the cost of computing, and they choose among individual
+leaf expansions. We use that decision rule for one step, "search this quiet
+checking move at a frontier node", with:
 
-What counts as "unstable" was chosen from DATA, not guessed (Phase 3,
-log_instability.py / analyze_instability.py). Our first hypothesis, "the side
-to move has a big capture available", turned out to be anti-predictive: the
-frontier hands over to quiescence, which already searches captures, so one
-more ply rarely changes those nodes. What quiescence does NOT see is forcing
-quiet moves, and the strongest predictor of "one more ply changes the value"
-was the number of checking moves available (n_checks). The capture-gain rule
-is kept as the ablation `inst_gain` so the report can show both.
+  expected gain  = E[change of the window-clipped value | step]   (error model,
+                   engine/error_model.py, learned offline from sampled frontier
+                   nodes like R&W's error distributions, bucketed by how forcing
+                   the check is: the number of replies the opponent has)
+  price          = lambda * measured mean nodes of the step * budget pressure
+  rule           = take the step iff gain >= price; best (most forcing) first
 
-The window gate: a node only matters for the minimax value if its value can
-land inside the (alpha, beta) window; far outside it the parent cuts off no
-matter what (project-plan.md, "Core research framing"). We approximate the
-node's value by its static evaluation and require
-    alpha - margin <= static <= beta + margin.
+Two further R&W ideas appear in exact form:
+  * Relevance. Extra moves can only RAISE the value of the side to move, so a
+    node whose plain value already reaches beta cannot change (search.py skips
+    it), and movement outside (alpha, beta) cannot change the search result;
+    the clipped-gain formula gives both for free. This replaces the old
+    hand-set "margin" around the window.
+  * Time cost grows as time runs out. R&W set the cost as an inverse function
+    of the time remaining per move; here, of the node budget remaining.
 
-Table safety (loophole 7): every decision uses only the child POSITION, its
-remaining depth and ply, and alpha/beta. The only path-dependent quantity is
-how many plies the line has already been extended, and that equals
-ply + depth - root_depth (a function of the node's own ply and depth). The TT
-stores the depth actually searched and an entry is reused only if it was
-searched at least as deep as needed. Two paths reaching the same position with
-different windows can still extend differently; that is the same trade-off real
-engines accept, and it is listed as a limitation in the report.
+Single-step assumption (R&W's own): each check is valued as if it were the only
+one searched; interactions between checks are ignored.
+
+Not taken: MGSS* itself (best-first, whole tree in memory, normal error curves
+from 35,000 samples) does not fit a depth-first alpha-beta engine, and its
+single-step assumption is known to fail as trees grow. Only the idea is used.
+
+Transposition-table safety: the decision is made at depth-0 nodes, which are
+never stored in the TT, and uses only the position, alpha and beta. A
+window-dependent decision therefore cannot change what the table stores for
+any node (the path-dependence risk that worried the plan, loophole 7). The
+check pass can still change the VALUE a depth-1 parent stores; that is the same
+trade-off any quiescence extension makes.
 """
 
-import json
-import os
 from functools import lru_cache
 from typing import Callable, Dict, List
 
 import chess
+import chess.polyglot
 
+from .error_model import ErrorModel, DEFAULT_PATH
 from .eval import evaluate
-from .features import max_capture_gain, count_checks
 
-DEFAULT_MODEL_PATH = os.path.join("data", "trigger_model.json")
 CHECK_MAX_EXT = 4      # cap on plies one line may gain from the check rule
+INF = 10 ** 9
+MAX_PRESSURE = 20.0    # budget pressure never prices a node above 20x
+
+
+def quiet_checks(board: chess.Board) -> List[chess.Move]:
+    """Checking moves that are not captures (captures are already searched by quiescence)."""
+    return [m for m in board.legal_moves
+            if not board.is_capture(m) and board.gives_check(m)]
+
+
+def _static_stm(board: chess.Board) -> int:
+    v = evaluate(board, terminal_checks=False)
+    return -v if board.turn == chess.BLACK else v
 
 
 class Controller:
@@ -89,10 +106,11 @@ class Controller:
                   ply: int, alpha: int, beta: int, stats) -> int:
         return 0
 
-    def checks_at_frontier(self, board: chess.Board, alpha: int, beta: int) -> bool:
-        """Called at every depth-0 node: should quiescence also try the quiet
-        checking moves here? Default: no."""
-        return False
+    def frontier_checks(self, board: chess.Board, q: int, alpha: int, beta: int,
+                        stats) -> List[chess.Move]:
+        """Quiet checking moves to search at this frontier node (empty = none).
+        `q` is the plain quiescence value already computed (side-to-move relative)."""
+        return []
 
 
 class NoExtension(Controller):
@@ -113,199 +131,103 @@ class CheckExtension(Controller):
         return 0
 
 
-def _static_stm(board: chess.Board) -> int:
-    v = evaluate(board, terminal_checks=False)
-    return -v if board.turn == chess.BLACK else v
+class BlindChecks(CheckExtension):
+    """Check rule + the check pass at every frontier node (no decision at all)."""
+    name = "qchk_all"
+
+    def frontier_checks(self, board, q, alpha, beta, stats):
+        return quiet_checks(board)
 
 
-class InstabilityExtension(Controller):
-    """
-    Check rule (optional) + a frontier extension when the position is unstable.
+class RandomChecks(CheckExtension):
+    """CONTROL, not a design: searches each quiet check with fixed probability p
+    (deterministic: decided by a hash of the position and move). Compare with
+    RWChecks at the same number of check searches to see whether its selection
+    carries any information beyond "do less of what qchk_all does"."""
+    name = "rand"
 
-    The instability test, all enabled conditions must hold:
-      min_checks  side to move has at least this many checking moves (0 = ignore)
-      min_gain    side to move has a capture winning at least this many
-                  centipawns on the first step (0 = ignore; the first
-                  hypothesis, kept as an ablation)
-    Then, unless use_window is False, the window gate applies.
-
-    margin      slack (cp) around the (alpha, beta) window in the gate.
-    max_ext     cap on plies one line may gain from the instability rule.
-    use_window  False = ablation: extend on instability alone, ignoring alpha/beta.
-    use_check   False = ablation: instability trigger only, no check rule.
-    """
-    name = "inst"
-
-    def __init__(self, min_checks: int = 2, min_gain: int = 0, margin: int = 150,
-                 max_ext: int = 2, use_window: bool = True, use_check: bool = True):
+    def __init__(self, p: float = 0.33):
         super().__init__()
-        if min_checks <= 0 and min_gain <= 0:
-            raise ValueError("an instability trigger needs min_checks or min_gain > 0")
-        self.min_checks = min_checks
-        self.min_gain = min_gain
-        self.margin = margin
-        self.max_ext = max_ext
-        self.use_window = use_window
-        self.use_check = use_check
+        self.p = p
 
-    def _window_relevant(self, board, alpha, beta) -> bool:
-        static = _static_stm(board)
-        return alpha - self.margin <= static <= beta + self.margin
-
-    def _unstable(self, board, alpha, beta) -> bool:
-        if self.min_gain > 0 and max_capture_gain(board) < self.min_gain:
-            return False
-        if self.min_checks > 0 and count_checks(board, self.min_checks) < self.min_checks:
-            return False
-        return (not self.use_window) or self._window_relevant(board, alpha, beta)
-
-    def extension(self, board, move, depth_after, ply, alpha, beta, stats):
-        used = self.path_extensions(depth_after, ply)
-        if board.is_check():
-            if self.use_check and used < CHECK_MAX_EXT:
-                return 1
-            return 0                       # in check: quiescence searches the evasions
-        if depth_after == 0 and used < self.max_ext and self._unstable(board, alpha, beta):
-            return 1
-        return 0
+    def frontier_checks(self, board, q, alpha, beta, stats):
+        key = chess.polyglot.zobrist_hash(board)
+        return [m for m in quiet_checks(board)
+                if ((key ^ (m.from_square * 64 + m.to_square) * 0x9E3779B97F4A7C15) >> 7) % 100 < self.p * 100]
 
 
-class QuiescenceChecks(InstabilityExtension):
+class RWChecks(CheckExtension):
     """
-    Check rule (optional) + "checks in quiescence" at unstable frontier nodes.
+    Check rule + search each quiet check whose  expected gain >= lambda * cost * pressure.
 
-    min_checks = 0 means ALWAYS search checks at the frontier (no trigger): the
-    unconditional version, used to ask whether the instability trigger earns its
-    keep or whether always doing it is just as good.
-    With min_checks >= 1 the trigger is the same as InstabilityExtension:
-    at least that many checking moves AND the window gate.
+    lam           centipawns of expected value a check must promise per node of
+                  search it costs. Tuned on the TRAIN split.
+    budget_aware  False = ablation: constant price, ignoring the remaining budget.
+    use_window    False = ablation: pretend the window is infinite, i.e. drop the
+                  relevance test and count any value change as useful.
+    use_check     False = ablation: no +1-ply check rule in the main search.
     """
-    name = "qchk"
+    name = "rw"
 
-    def __init__(self, min_checks: int = 2, margin: int = 150,
+    def __init__(self, model: ErrorModel, lam: float = 1.0, budget_aware: bool = True,
                  use_window: bool = True, use_check: bool = True):
-        super().__init__(min_checks=max(min_checks, 1), margin=margin,
-                         use_window=use_window, use_check=use_check)
-        self.unconditional = min_checks <= 0
+        super().__init__()
+        self.model, self.lam = model, lam
+        self.budget_aware, self.use_window, self.use_check = budget_aware, use_window, use_check
 
     def extension(self, board, move, depth_after, ply, alpha, beta, stats):
-        # only the check rule extends depth; the instability part acts in quiescence
-        if board.is_check() and self.use_check and \
-                self.path_extensions(depth_after, ply) < CHECK_MAX_EXT:
-            return 1
-        return 0
+        if not self.use_check:
+            return 0
+        return super().extension(board, move, depth_after, ply, alpha, beta, stats)
 
-    def checks_at_frontier(self, board, alpha, beta) -> bool:
-        if board.is_check():
-            return False              # quiescence already searches every evasion
-        return self.unconditional or self._unstable(board, alpha, beta)
+    @staticmethod
+    def pressure(stats) -> float:
+        """Price multiplier from the budget left: 1 with a full budget, rising as
+        it is used up (R&W: time cost is an inverse function of time remaining)."""
+        if stats.node_limit is None:
+            return 1.0
+        remaining = 1.0 - stats.nodes / stats.node_limit
+        return MAX_PRESSURE if remaining <= 1.0 / MAX_PRESSURE else 1.0 / remaining
 
+    def frontier_checks(self, board, q, alpha, beta, stats):
+        checks = quiet_checks(board)
+        if not checks:
+            return []
+        # q <= alpha means plain quiescence only told us "at most alpha"; its
+        # stand-pat floor (static value) is then the safe (low) estimate.
+        base = q if q > alpha else min(_static_stm(board), alpha)
+        a, b = (alpha, beta) if self.use_window else (-INF, INF)
+        rate = self.lam * (self.pressure(stats) if self.budget_aware else 1.0)
+        chosen = []
+        for m in checks:
+            board.push(m)
+            replies = board.legal_moves.count()
+            board.pop()
+            if self.model.expected_gain(replies, base, a, b) >= rate * self.model.cost(replies):
+                chosen.append((replies, m))
+        chosen.sort(key=lambda t: t[0])         # most forcing first: raises alpha early
+        return [m for _, m in chosen]
 
-class TriggerModel:
-    """
-    P(value changes when searched one ply deeper | feature bucket), and the mean
-    size of that change, estimated from data (log_instability.py +
-    analyze_instability.py) and stored as JSON:
-
-        {"feature": "n_checks", "edges": [0, 1, 2, 3, 5],
-         "p": [...], "shift": [...], "n": [...], ...}
-
-    Bucket i covers edges[i] <= value < edges[i+1]; the last bucket is open-ended.
-    """
-
-    def __init__(self, feature: str, edges: List[int], p: List[float], shift: List[float]):
-        if not (len(edges) == len(p) == len(shift)) or not edges:
-            raise ValueError("edges, p and shift must be non-empty and the same length")
-        self.feature, self.edges, self.p, self.shift = feature, list(edges), list(p), list(shift)
-
-    @classmethod
-    def load(cls, path: str = DEFAULT_MODEL_PATH) -> "TriggerModel":
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"Trigger model not found: {path}. Build it first:\n"
-                "  python log_instability.py\n  python analyze_instability.py")
-        with open(path) as f:
-            d = json.load(f)
-        return cls(d["feature"], d["edges"], d["p"], d["shift"])
-
-    def _bucket(self, value: int) -> int:
-        i = 0
-        for k, e in enumerate(self.edges):
-            if value >= e:
-                i = k
-        return i
-
-    def p_change(self, value: int) -> float:
-        return self.p[self._bucket(value)]
-
-    def expected_shift(self, value: int) -> float:
-        """P(change) * mean size of the change, in centipawns."""
-        i = self._bucket(value)
-        return self.p[i] * self.shift[i]
-
-
-class CostWeightedExtension(InstabilityExtension):
-    """
-    Extend at the frontier when
-
-        P(change | n_checks) * shift   >=   lam * cost,     cost = n_legal / 30
-
-    i.e. the expected value shift an extension promises must beat lam times its
-    estimated price. cost is the number of legal moves over 30 (one extra ply
-    costs roughly in proportion to the branching factor; 30 is typical for a
-    middlegame). `lam` is in centipawn units. Tune it on the TRAIN split
-    (run_baseline.py --split train) and report on the test split.
-    Needs data/trigger_model.json built on n_checks.
-    """
-    name = "costw"
-
-    def __init__(self, model: TriggerModel, lam: float = 40.0, margin: int = 150,
-                 max_ext: int = 2, use_check: bool = True):
-        super().__init__(min_checks=1, margin=margin, max_ext=max_ext,
-                         use_window=True, use_check=use_check)
-        if model.feature != "n_checks":
-            raise ValueError(f"CostWeightedExtension needs a model on n_checks, got {model.feature}")
-        self.model = model
-        self.lam = lam
-
-    def _unstable(self, board, alpha, beta) -> bool:
-        checks = count_checks(board)
-        if checks < 1:
-            return False
-        cost = max(1, sum(1 for _ in board.legal_moves)) / 30.0
-        if self.model.expected_shift(checks) < self.lam * cost:
-            return False
-        return self._window_relevant(board, alpha, beta)
-
-
-# ---------------------------------------------------------------------------
-# Registry: name -> zero-argument factory. The harness turns each entry into an
-# engine version, so adding a variant here makes it runnable everywhere
-# (run_baseline.py --engines ..., compare_engines.py, match.py).
-# ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=None)
-def _cached_model(path: str) -> TriggerModel:
-    return TriggerModel.load(path)
+def _cached_model(path: str) -> ErrorModel:
+    return ErrorModel.load(path)
 
 
-def controller_factories(model_path: str = DEFAULT_MODEL_PATH) -> Dict[str, Callable[[], Controller]]:
+def controller_factories(model_path: str = DEFAULT_PATH) -> Dict[str, Callable[[], Controller]]:
+    """name -> zero-argument factory. The harness turns each entry into an engine
+    version, so one line here makes a variant runnable from run_baseline.py,
+    compare_engines.py and match.py."""
+    m = lambda: _cached_model(model_path)
     f: Dict[str, Callable[[], Controller]] = {
-        "check":        lambda: CheckExtension(),
-        "inst_c1":      lambda: InstabilityExtension(min_checks=1),
-        "inst_c2":      lambda: InstabilityExtension(min_checks=2),
-        "inst_c3":      lambda: InstabilityExtension(min_checks=3),
-        # ablations of inst_c2:
-        "inst_c2_nowin":   lambda: InstabilityExtension(min_checks=2, use_window=False),
-        "inst_c2_nocheck": lambda: InstabilityExtension(min_checks=2, use_check=False),
-        # the first hypothesis (capture gain), kept to report the negative result:
-        "inst_gain200": lambda: InstabilityExtension(min_checks=0, min_gain=200),
+        "check":    lambda: CheckExtension(),
+        "qchk_all": lambda: BlindChecks(),
     }
-    f["qchk_all"] = lambda: QuiescenceChecks(min_checks=0)
-    for k in (1, 2, 3):
-        f[f"qchk_c{k}"] = (lambda k=k: QuiescenceChecks(min_checks=k))
-    f["qchk_c2_nowin"] = lambda: QuiescenceChecks(min_checks=2, use_window=False)
-    for lam in (10, 20, 40, 80):   # ~ shift of 1 check / 2+ checks / 5+ checks, see analyze_instability.py
-        f[f"costw_l{lam}"] = (lambda lam=lam: CostWeightedExtension(
-            _cached_model(model_path), lam=float(lam)))
+    for lam in (0.1, 0.25, 0.5, 1, 2):
+        f[f"rw_l{lam}"] = (lambda lam=lam: RWChecks(m(), lam=lam))
+    f["rand_p33"] = lambda: RandomChecks(0.33)   # control for rw_*: same pass rate, no logic
+    # ablations of one setting (re-point them at the tuned lambda once chosen)
+    f["rw_l0.1_nobudget"] = lambda: RWChecks(m(), lam=0.1, budget_aware=False)
+    f["rw_l0.1_nowindow"] = lambda: RWChecks(m(), lam=0.1, use_window=False)
+    f["rw_l0.1_nocheck"]  = lambda: RWChecks(m(), lam=0.1, use_check=False)
     return f

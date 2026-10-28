@@ -21,10 +21,11 @@ from dataclasses import dataclass
 from .eval import evaluate
 from .tt import TranspositionTable, Flag
 
-SEARCH_VERSION = "3"   # bump whenever search behaviour changes: results files record it
+SEARCH_VERSION = "4"   # bump whenever search behaviour changes: results files record it
                        # 1 = Phase 1 baseline; 2 = cheap draw/repetition, TT mate
                        # scores by ply, check evasions in quiescence, controllers;
-                       # 3 = partial-iteration results, checks in quiescence (controller-gated)
+                       # 3 = partial-iteration results, checks in quiescence (controller-gated);
+                       # 4 = two-phase frontier: plain quiescence, then a controller-priced check pass
 
 MATE_SCORE = 100000
 INF = 10 ** 9
@@ -128,8 +129,7 @@ def order_moves(board: chess.Board, moves, tt_move: chess.Move = None):
 
 
 def quiescence(board: chess.Board, alpha: int, beta: int,
-                stats: SearchStats, ply: int = 0, q_ply: int = 0,
-                checks: bool = False) -> int:
+                stats: SearchStats, ply: int = 0, q_ply: int = 0) -> int:
     """
     Captures-only quiescence search. Called at every depth==0 leaf instead
     of evaluate() directly -- this is what stops the engine from stopping
@@ -138,12 +138,6 @@ def quiescence(board: chess.Board, alpha: int, beta: int,
     Two separate counters: `ply` is the TOTAL distance from the root (used
     for mate-distance scores, so they match the main search), `q_ply` is
     how deep we are inside quiescence only (used for the safety cap).
-
-    checks=True (only honoured at q_ply 0, outside check) additionally searches
-    the quiet moves that give check, after the captures. Captures-only
-    quiescence cannot see a mate or a winning attack that starts with a quiet
-    check, so this is the cheap way to look for exactly the forcing moves it
-    misses. Controllers switch it on only at unstable frontier nodes.
 
     Uses the standard "stand pat" idea: the side to move isn't FORCED to
     capture, so the static eval is itself a valid lower bound on the score.
@@ -177,9 +171,6 @@ def quiescence(board: chess.Board, alpha: int, beta: int,
         if q_ply >= MAX_QUIESCENCE_PLY:
             return alpha
         moves = order_moves(board, list(board.generate_legal_captures()))
-        if checks and q_ply == 0:
-            moves += [m for m in board.legal_moves
-                      if not board.is_capture(m) and board.gives_check(m)]
 
     for move in moves:
         board.push(move)
@@ -192,6 +183,50 @@ def quiescence(board: chess.Board, alpha: int, beta: int,
             alpha = score
 
     return alpha
+
+
+def check_pass(board: chess.Board, checks, base: int, alpha: int, beta: int,
+               stats: SearchStats, ply: int) -> int:
+    """
+    Second phase of a frontier search: try the quiet CHECKING moves `checks`
+    on top of a value `base` that plain quiescence already secured.
+
+    Adding moves for the side to move can only RAISE its value (it takes the
+    max over more options), so the result is max(base, best check) clipped to
+    the window. That monotonicity is what lets a controller decide, from `base`
+    and the window alone, whether this pass could possibly matter (see
+    RWChecks in engine/extensions.py).
+    """
+    a = max(alpha, base)
+    for move in checks:
+        board.push(move)
+        score = -quiescence(board, -beta, -a, stats, ply + 1, 1)
+        board.pop()
+        if score >= beta:
+            return beta
+        if score > a:
+            a = score
+    return a
+
+
+def frontier_search(board: chess.Board, alpha: int, beta: int,
+                    stats: SearchStats, ply: int, ctl=None) -> int:
+    """
+    Value of a depth-0 node. Plain quiescence first; then, only if the
+    controller says the extra work is worth its price, the check pass.
+    Nothing here is stored in the TT (depth-0 nodes are never stored), so a
+    window-dependent decision cannot leak into the table.
+    """
+    q = quiescence(board, alpha, beta, stats, ply=ply)
+    if ctl is None or q >= beta or board.is_check():
+        # q >= beta: already a cutoff and extra moves can only raise it -> nothing
+        # can change. In check: quiescence already searched every evasion.
+        return q
+    checks = ctl.frontier_checks(board, q, alpha, beta, stats)
+    if not checks:
+        return q
+    stats.extensions += 1
+    return check_pass(board, checks, q, alpha, beta, stats, ply)
 
 
 def alphabeta(board: chess.Board, depth: int, alpha: int, beta: int,
@@ -236,10 +271,7 @@ def alphabeta(board: chess.Board, depth: int, alpha: int, beta: int,
         stats.leaf_nodes += 1
         if stats.frontier_hook is not None:
             stats.frontier_hook(board, ply)
-        want_checks = ctl is not None and ctl.checks_at_frontier(board, alpha, beta)
-        if want_checks:
-            stats.extensions += 1
-        return quiescence(board, alpha, beta, stats, ply=ply, checks=want_checks)
+        return frontier_search(board, alpha, beta, stats, ply, ctl)
 
     best = -INF
     best_move = None
